@@ -1,0 +1,92 @@
+name: Windows Build (fork)
+
+# fork 专用：推送到 win-build 分支即自动构建，也可合并到 main 后手动触发。
+# 只产出 NSIS + MSI，不创建 Release、不写任何 secret，产物在 Actions artifacts。
+
+on:
+  # workflow_dispatch 只有在默认分支存在该文件时才会出现在 Actions 列表里，
+  # 这个分支上靠 push 触发；合并到 main 后就能手动点按钮。
+  push:
+    branches:
+      - win-build
+  workflow_dispatch:
+    inputs:
+      offline_bundle:
+        description: 构建离线捆绑包（内置 Node/pnpm/dsh，体积约 275MB）
+        type: boolean
+        default: false
+      dsh_tag:
+        description: 离线包内置的 dsh 版本 tag（仅 offline_bundle 生效）
+        type: string
+        default: v0.2.1-rc.2
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js and pnpm
+        uses: ./.github/actions/setup-node-pnpm
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      # 上游 build-windows.yml 没有 Rust 缓存，fork 里补上，二次构建能省一半时间。
+      - name: Cache Rust artifacts
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      # 离线包需要把 Windows 版 node.exe / pnpm / dsh 解到 src-tauri/resources。
+      - name: Prepare bundled resources
+        if: inputs.offline_bundle
+        uses: ./.github/actions/prepare-bundle-resources
+        with:
+          platform: windows
+          arch: x64
+          dsh-tag: ${{ inputs.dsh_tag }}
+          bundle-git: false
+
+      # WiX 只接受纯数字版本（0.25.0-rc.1 这类会直接失败），单独覆盖。
+      - name: Prepare MSI version override
+        shell: bash
+        run: |
+          node -e "
+            const fs = require('fs');
+            const rawVer = require('./src-tauri/tauri.conf.json').version;
+            const cleanVer = rawVer.replace(/[-+].*$/, '');
+            fs.writeFileSync('release-msi-version.tmp.json', JSON.stringify({ bundle: { windows: { wix: { version: cleanVer } } } }));
+          "
+
+      - name: Build installer
+        shell: bash
+        run: pnpm tauri build --config release-msi-version.tmp.json
+
+      - name: Normalize release asset names
+        shell: bash
+        run: node scripts/rename-release-assets.mjs src-tauri/target/release/bundle/nsis src-tauri/target/release/bundle/msi
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          name: windows-build
+          path: |
+            src-tauri/target/release/bundle/nsis/*.exe
+            src-tauri/target/release/bundle/msi/*.msi
+          if-no-files-found: error
+          retention-days: 14
